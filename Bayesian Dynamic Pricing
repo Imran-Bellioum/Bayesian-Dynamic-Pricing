@@ -1,0 +1,202 @@
+import numpy as np
+from tabulate import tabulate
+from scipy.optimize import linprog
+import scipy.stats as stats
+import matplotlib
+from matplotlib import pyplot as plt
+import matplotlib.animation as animation
+
+np.set_printoptions(precision=2)
+
+def tabprint(msg, matrix):
+    print(msg)
+    print(tabulate(matrix, tablefmt="fancy_grid"))
+
+plt.rcParams.update({'font.family': 'Candara', 'font.serif': ['Candara']})
+plt.rcParams.update({'pdf.fonttype': 'truetype', 'font.size': 18})
+
+
+def optimal_price_distribution(prices, demand_estimates, inventory):
+    """
+    Find the optimal randomised pricing policy given current demand estimates
+    and inventory constraints.
+
+    Uses linear programming to maximise expected revenue subject to:
+      - price probabilities summing to 1
+      - expected demand not exceeding available inventory
+
+    Args:
+        prices:           vector of candidate price levels
+        demand_estimates: vector of estimated demand at each price
+        inventory:        scalar — number of available units
+
+    Returns:
+        price_distribution: probability vector over price levels
+    """
+    expected_revenues = np.multiply(prices, demand_estimates)
+    n_prices = len(prices)
+
+    prob_sum_constraint        = np.full([1, n_prices], 1)
+    prob_sum_bound             = [[1]]
+    demand_constraint_matrix   = [demand_estimates]
+
+    result = linprog(
+        -np.array(expected_revenues).flatten(),
+        A_eq=prob_sum_constraint,
+        b_eq=prob_sum_bound,
+        A_ub=demand_constraint_matrix,
+        b_ub=np.array([inventory]),
+        bounds=(0, None)
+    )
+
+    price_distribution = np.array(result.x).reshape(1, n_prices).flatten()
+    return price_distribution
+
+
+# ── Price levels and true (hidden) demand parameters ──────────────────────────
+
+prices = [1.99, 2.49, 2.99, 3.49, 3.99, 4.49]
+
+true_demand_intercept = 50   # true linear demand: D(p) = intercept - slope * p
+true_demand_slope     = 7
+
+# Sanity check: print true demands and revenues at each price
+true_demands  = list(map(lambda p: true_demand_intercept - true_demand_slope * p, prices))
+true_revenues = np.multiply(prices, true_demands)
+print("True demands: ", true_demands)
+print("True revenues:", true_revenues)
+print("Optimal distribution:", optimal_price_distribution(prices, true_demands, 60))
+
+
+# ── Bayesian beliefs: Gamma prior over demand at each price ────────────────────
+# Demand modelled as Poisson(λ); conjugate prior on λ is Gamma(alpha, beta)
+# Posterior update: alpha += observed_demand, beta += 1
+
+demand_beliefs = []
+for p in prices:
+    demand_beliefs.append({
+        'price': p,
+        'alpha': 30.0,   # prior shape
+        'beta':  1.0,    # prior rate
+        'mean':  30.0    # prior mean = alpha / beta
+    })
+
+
+def sample_from_gamma(alpha, beta):
+    """Sample from Gamma(alpha, beta) using shape/scale parameterisation."""
+    return np.random.gamma(shape=alpha, scale=1.0 / beta)
+
+
+def observe_demand(price):
+    """Sample realised demand at a given price from the true (hidden) model."""
+    true_mean = true_demand_intercept - true_demand_slope * price
+    return np.random.poisson(true_mean, 1)[0]
+
+
+def sample_demand_estimates(demand_beliefs):
+    """
+    Thompson Sampling: draw one demand estimate per price from current beliefs.
+    This balances exploration (uncertain prices) with exploitation (high-mean prices).
+    """
+    return list(map(lambda b: sample_from_gamma(b['alpha'], b['beta']), demand_beliefs))
+
+
+# ── Simulation loop ────────────────────────────────────────────────────────────
+
+n_rounds = 50
+history  = []
+
+for round_t in range(n_rounds):
+    # Step 1: Thompson sample — draw demand estimates from current beliefs
+    demand_estimates = sample_demand_estimates(demand_beliefs)
+    print(tabulate(np.array(demand_beliefs), tablefmt="fancy_grid"))
+    print("Demand estimates:", np.array(demand_estimates))
+
+    # Step 2: Solve LP to get optimal randomised pricing policy
+    price_distribution = optimal_price_distribution(prices, demand_estimates, inventory=60)
+
+    # Step 3: Select price stochastically and observe true demand
+    selected_price_index = np.random.choice(len(prices), 1, p=price_distribution)[0]
+    selected_price       = prices[selected_price_index]
+    realised_demand      = observe_demand(selected_price)
+
+    print('Selected price %.2f => demand %d, revenue %.2f' % (
+        selected_price, realised_demand, realised_demand * selected_price))
+
+    # Step 4: Save belief snapshot for animation
+    belief_snapshot = [b.copy() for b in demand_beliefs]
+    history.append([selected_price, realised_demand, realised_demand * selected_price, belief_snapshot])
+
+    # Step 5: Bayesian update — Gamma-Poisson conjugate update
+    belief = demand_beliefs[selected_price_index]
+    belief['alpha'] += realised_demand   # posterior shape
+    belief['beta']  += 1                 # posterior rate
+    belief['mean']   = belief['alpha'] / belief['beta']
+
+    print()
+
+
+# ── Visualisation ──────────────────────────────────────────────────────────────
+
+def visualize_snapshot(round_t):
+    """Plot demand PDFs, revenue PDFs, and realised price/demand up to round t."""
+
+    # Panel 1: Posterior demand distributions for each price
+    plt.subplot(3, 1, 1)
+    plt.xlabel('Demand')
+    plt.ylabel('Demand PDF')
+    plt.title('Posterior demand distributions by price')
+    x_demand = np.linspace(0, 60, 200)
+    for belief in history[round_t][3]:
+        y = stats.gamma.pdf(x_demand, a=belief['alpha'], scale=1.0 / belief['beta'])
+        plt.plot(x_demand, y, '-', label='price %.2f' % belief['price'])
+    plt.legend(loc='upper left')
+    plt.ylim([0, 0.5])
+    plt.grid(True)
+
+    # Panel 2: Implied revenue distributions for each price
+    plt.subplot(3, 1, 2)
+    plt.xlabel('Revenue')
+    plt.ylabel('Revenue PDF')
+    plt.title('Implied revenue distributions by price')
+    x_revenue = np.linspace(30, 110, 200)
+    for belief in history[round_t][3]:
+        # Revenue ~ Gamma(alpha * price, beta) by scaling property
+        y = stats.gamma.pdf(x_revenue, a=belief['alpha'] * belief['price'], scale=1.0 / belief['beta'])
+        plt.plot(x_revenue, y, '-', label='price %.2f' % belief['price'])
+    plt.legend(loc='upper left')
+    plt.ylim([0, 0.3])
+
+    # Panel 3: Realised prices and demands over time
+    plt.subplot(3, 1, 3)
+    plt.xlabel('Round')
+    plt.ylabel('Demand / Price')
+    plt.title('Realised demand and selected price over time')
+    realised_prices  = [h[0] for h in history]
+    realised_demands = [h[1] for h in history]
+    plt.plot(range(round_t + 1), np.array(realised_prices)[:round_t + 1], 'r-')
+    padded_demands = np.pad(np.array(realised_demands)[:round_t + 1], (0, n_rounds - 2 - round_t), 'constant')
+    plt.bar(range(n_rounds - 1), padded_demands, 0.35, color='#9999ee')
+    plt.ylim([0, 40])
+
+
+# Static final-state plot
+fig = plt.figure(figsize=(10, 12))
+plt.subplots_adjust(hspace=0.5)
+visualize_snapshot(n_rounds - 2)
+plt.show()
+
+# Animated simulation replay
+fig = plt.figure(figsize=(10, 12))
+plt.subplots_adjust(hspace=0.5)
+
+current_frame = 0
+
+def animate(frame):
+    global current_frame
+    fig.clear()
+    visualize_snapshot(current_frame)
+    current_frame += 1
+
+ani = matplotlib.animation.FuncAnimation(fig, animate, frames=n_rounds - 3, repeat=True)
+ani.save('bayesian_dynamic_pricing.gif', writer='imagemagick', fps=10, dpi=90)
